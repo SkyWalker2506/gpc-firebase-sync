@@ -71,22 +71,23 @@ function _docRef(key) {
   return doc(db, COLLECTION, key);
 }
 
-// ── Echo prevention — track timestamps we pushed ourselves ────────────────
-// When our own pushState resolves, we store the ts here for 2s so watchState
-// can skip the echo even if the Firestore round-trip arrives before the async
-// setDoc resolves (race window).
-const _ownPushTs = new Map(); // key -> Set<ts>
+// ── Echo prevention — track the most-recent ts we pushed per key ──────────
+// Using a simple Map<key, lastPushedTs> (no expiry) is more robust than a
+// time-expiring Set: Firestore snapshot round-trips can exceed 2s on slow
+// connections, causing the old 2s window to expire before the echo arrives.
+// We keep the guard alive until a NEWER snapshot (from another tab/device)
+// arrives, at which point we clear it so future remote writes aren't blocked.
+const _ownPushTs = new Map(); // key -> lastPushedTs (number)
 function _markOwnPush(key, ts) {
-  if (!_ownPushTs.has(key)) _ownPushTs.set(key, new Set());
-  _ownPushTs.get(key).add(ts);
-  setTimeout(() => {
-    const s = _ownPushTs.get(key);
-    if (s) s.delete(ts);
-  }, 2000);
+  _ownPushTs.set(key, ts);
 }
 function _isOwnEcho(key, ts) {
-  const s = _ownPushTs.get(key);
-  return s ? s.has(ts) : false;
+  const last = _ownPushTs.get(key);
+  if (last === undefined) return false;
+  if (ts === last) return true;
+  // ts > last means a genuinely newer remote write — clear our guard
+  if (ts > last) _ownPushTs.delete(key);
+  return false;
 }
 
 // ── Core API ──────────────────────────────────────────────────────────────
