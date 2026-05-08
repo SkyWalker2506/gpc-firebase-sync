@@ -140,6 +140,15 @@ async function pushState(key, value) {
   }
 }
 
+// ── Sanitizer hooks ───────────────────────────────────────────────────────
+// Consumers can register a sanitizer fn(value) -> sanitizedValue per key.
+// watchState will apply the sanitizer before writing to localStorage and
+// push the clean value back to Firestore if the sanitizer made changes.
+const _sanitizers = new Map();
+function registerSanitizer(key, fn) {
+  _sanitizers.set(key, fn);
+}
+
 /**
  * Subscribe to live Firestore changes for key.
  * callback(value) is called only when the remote updatedAt is strictly
@@ -152,9 +161,15 @@ function watchState(key, callback) {
     const { value, updatedAt } = snap.data();
     const localTs = _localTs(key);
     if (updatedAt > localTs && !_isOwnEcho(key, updatedAt)) {
-      _origSetItem(key, JSON.stringify(value));
+      const sanitized = _sanitizers.has(key) ? _sanitizers.get(key)(value) : value;
+      _origSetItem(key, JSON.stringify(sanitized));
       _storeLocalTs(key, updatedAt);
-      try { callback(value); } catch (e) { console.warn('[GPC_FIREBASE] watchState callback error', e); }
+      try { callback(sanitized); } catch (e) { console.warn('[GPC_FIREBASE] watchState callback error', e); }
+      // If the sanitizer mutated the value, push the clean version back so
+      // Firestore doesn't keep serving the stale data to other clients.
+      if (sanitized !== value) {
+        (async () => { try { await pushState(key, sanitized); } catch (_) {} })();
+      }
     }
   }, (err) => {
     console.warn('[GPC_FIREBASE] watchState listener error for', key, err);
@@ -247,6 +262,7 @@ const GPC_FIREBASE = {
   onStatusChange(fn) { _statusListeners.push(fn); },
   migrateFromLocalStorage,
   interceptLocalStorage,
+  registerSanitizer,
 };
 window.GPC_FIREBASE = GPC_FIREBASE;
 
