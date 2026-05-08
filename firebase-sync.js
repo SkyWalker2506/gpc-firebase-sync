@@ -4,11 +4,12 @@
 // source; Firestore is the sync backend. On first load, any local data that
 // doesn't exist in Firestore yet is migrated automatically.
 //
-// Usage (in HTML): <script type="module" src="./lib/firebase-sync/firebase-sync.js?v=1"></script>
+// Usage (in HTML): <script type="module" src="./lib/firebase-sync/firebase-sync.js?v=2"></script>
 // Then in any other script: await window.GPC_FIREBASE_READY  (Promise)
 //                            window.GPC_FIREBASE.pullState(key)
 //                            window.GPC_FIREBASE.pushState(key, value)
 //                            window.GPC_FIREBASE.watchState(key, callback)
+//                            window.GPC_FIREBASE.syncNow()
 
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js';
 import {
@@ -36,6 +37,10 @@ const TS_PREFIX = 'gpc_fb_ts_';
 const app = initializeApp(firebaseConfig, 'gpc-sync');
 const db = getFirestore(app);
 
+// Capture original setItem BEFORE any interceptor is installed.
+// This guarantees _origSetItem is always valid regardless of call order.
+const _origSetItem = localStorage.setItem.bind(localStorage);
+
 // ── Status ────────────────────────────────────────────────────────────────
 const _statusListeners = [];
 const syncStatus = {
@@ -57,13 +62,31 @@ function _localTs(key) {
   return Number(localStorage.getItem(TS_PREFIX + key) || 0);
 }
 function _storeLocalTs(key, ts) {
-  localStorage.setItem(TS_PREFIX + key, String(ts));
+  _origSetItem(TS_PREFIX + key, String(ts));
 }
 function _localValue(key) {
   try { return JSON.parse(localStorage.getItem(key) || 'null'); } catch (_) { return null; }
 }
 function _docRef(key) {
   return doc(db, COLLECTION, key);
+}
+
+// ── Echo prevention — track timestamps we pushed ourselves ────────────────
+// When our own pushState resolves, we store the ts here for 2s so watchState
+// can skip the echo even if the Firestore round-trip arrives before the async
+// setDoc resolves (race window).
+const _ownPushTs = new Map(); // key -> Set<ts>
+function _markOwnPush(key, ts) {
+  if (!_ownPushTs.has(key)) _ownPushTs.set(key, new Set());
+  _ownPushTs.get(key).add(ts);
+  setTimeout(() => {
+    const s = _ownPushTs.get(key);
+    if (s) s.delete(ts);
+  }, 2000);
+}
+function _isOwnEcho(key, ts) {
+  const s = _ownPushTs.get(key);
+  return s ? s.has(ts) : false;
 }
 
 // ── Core API ──────────────────────────────────────────────────────────────
@@ -79,10 +102,7 @@ async function pullState(key) {
       const { value, updatedAt } = snap.data();
       const localTs = _localTs(key);
       if (updatedAt > localTs) {
-        // Firestore is newer — mirror to local using original setItem to avoid
-        // re-triggering the interceptor.
-        const orig = _origSetItem || localStorage.setItem.bind(localStorage);
-        orig(key, JSON.stringify(value));
+        _origSetItem(key, JSON.stringify(value));
         _storeLocalTs(key, updatedAt);
         return value;
       }
@@ -101,9 +121,10 @@ async function pushState(key, value) {
   const updatedAt = Date.now();
   // Write local immediately (optimistic) using original setItem to avoid
   // recursive intercept.
-  const orig = _origSetItem || localStorage.setItem.bind(localStorage);
-  orig(key, JSON.stringify(value));
+  _origSetItem(key, JSON.stringify(value));
   _storeLocalTs(key, updatedAt);
+  // Mark this ts as our own so watchState won't echo it back.
+  _markOwnPush(key, updatedAt);
   // Mark pending
   syncStatus.pendingKeys.add(key);
   _setStatus('syncing');
@@ -121,7 +142,7 @@ async function pushState(key, value) {
 /**
  * Subscribe to live Firestore changes for key.
  * callback(value) is called only when the remote updatedAt is strictly
- * newer than our local mirror (avoids echoing our own pushState writes).
+ * newer than our local mirror AND is not an echo of our own push.
  * Returns an unsubscribe function.
  */
 function watchState(key, callback) {
@@ -129,9 +150,8 @@ function watchState(key, callback) {
     if (!snap.exists()) return;
     const { value, updatedAt } = snap.data();
     const localTs = _localTs(key);
-    if (updatedAt > localTs) {
-      const orig = _origSetItem || localStorage.setItem.bind(localStorage);
-      orig(key, JSON.stringify(value));
+    if (updatedAt > localTs && !_isOwnEcho(key, updatedAt)) {
+      _origSetItem(key, JSON.stringify(value));
       _storeLocalTs(key, updatedAt);
       try { callback(value); } catch (e) { console.warn('[GPC_FIREBASE] watchState callback error', e); }
     }
@@ -160,19 +180,42 @@ async function migrateFromLocalStorage(keys) {
   }
 }
 
+/**
+ * Pull all watched keys from Firestore, apply to localStorage, dispatch
+ * storage events so in-page editors react. Sets status to syncing/online.
+ * Exposed on GPC_FIREBASE so the status pill button can call it.
+ */
+async function syncNow() {
+  const keys = window.GPC_FIREBASE_KEYS || [];
+  _setStatus('syncing');
+  for (const k of keys) {
+    try {
+      const val = await pullState(k);
+      if (val !== null) {
+        try {
+          window.dispatchEvent(new StorageEvent('storage', {
+            key: k,
+            newValue: JSON.stringify(val),
+            storageArea: localStorage,
+          }));
+        } catch (_) {}
+      }
+    } catch (_) {}
+  }
+  _setStatus(navigator.onLine ? 'online' : 'offline');
+}
+
 // ── localStorage interceptor ──────────────────────────────────────────────
 // Wraps localStorage.setItem so that writes to any watched key are
 // automatically mirrored to Firestore without touching each editor's code.
 const _interceptedKeys = new Set();
 const _interceptDebounce = {};
-let _origSetItem = null;
 let _interceptInstalled = false;
 
 function interceptLocalStorage(keys) {
   keys.forEach((k) => _interceptedKeys.add(k));
   if (_interceptInstalled) return;
   _interceptInstalled = true;
-  _origSetItem = localStorage.setItem.bind(localStorage);
 
   Object.defineProperty(localStorage, 'setItem', {
     value: function (key, value) {
@@ -183,7 +226,6 @@ function interceptLocalStorage(keys) {
         _interceptDebounce[key] = setTimeout(() => {
           try {
             const parsed = JSON.parse(value);
-            // Push to Firestore (uses _origSetItem internally so no recursion)
             pushState(key, parsed);
           } catch (_) {}
         }, 300);
@@ -199,6 +241,7 @@ const GPC_FIREBASE = {
   pullState,
   pushState,
   watchState,
+  syncNow,
   syncStatus,
   onStatusChange(fn) { _statusListeners.push(fn); },
   migrateFromLocalStorage,
@@ -223,10 +266,9 @@ window.GPC_FIREBASE_READY = new Promise((res) => { _resolveReady = res; });
 // are automatically mirrored to Firestore.
 interceptLocalStorage(GPC_FIREBASE_KEYS);
 
-// Start live listeners for all keys. When a remote change arrives, dispatch
-// a storage event so editor JS picks it up automatically (same mechanism as
-// cross-tab localStorage events, but now works cross-device too).
-GPC_FIREBASE_KEYS.forEach((key) => {
+// Start live listeners for all keys. Store unsubscribe fns so they can be
+// cleaned up on page unload to prevent memory leaks.
+const _unsubscribers = GPC_FIREBASE_KEYS.map((key) =>
   watchState(key, (value) => {
     // value is already mirrored to localStorage inside watchState.
     // Dispatch storage event so in-page consumers (editors) react.
@@ -237,7 +279,12 @@ GPC_FIREBASE_KEYS.forEach((key) => {
         storageArea: localStorage,
       }));
     } catch (_) {}
-  });
+  })
+);
+
+// Clean up Firestore listeners on page unload to prevent memory leaks.
+window.addEventListener('beforeunload', () => {
+  _unsubscribers.forEach((unsub) => { try { unsub(); } catch (_) {} });
 });
 
 // Auto-migrate on load, then resolve ready
